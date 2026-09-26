@@ -215,6 +215,86 @@ jobs:
             exit 1
           fi
 
+      - name: Locate Build ZIP
+        id: locate_zip
+        if: steps.build_rom.outputs.BUILD_SUCCESS == 'true'
+        run: |
+          PRODUCT_DIR="$AOSP_SOURCE_DIR/out/target/product/$DEVICE"
+          echo "Scanning $PRODUCT_DIR for ROM zips..."
+
+          if [ ! -d "$PRODUCT_DIR" ]; then
+            echo "::error::Product dir not found: $PRODUCT_DIR"
+            exit 1
+          fi
+
+          rm -rf "${{ github.workspace }}/dist"
+          mkdir -p "${{ github.workspace }}/dist"
+
+          # Pick the flashable ROM zip. Guard on size (mirroring builder/build.sh)
+          # so a truncated/partial zip is never published, and prefer a real ROM
+          # over an OTA package or a target_files debug dump.
+          pick_zip() {
+            find "$PRODUCT_DIR" -maxdepth 1 -name "*.zip" -type f "$@" -printf '%s %p\n' \
+              | sort -rn | head -n 1 | cut -d' ' -f2-
+          }
+          ROM_ZIP=""
+          for SIZE in "-size +500M" "-size +1M" ""; do
+            ROM_ZIP=$(pick_zip $SIZE ! -name "target_files*.zip" ! -name "ota_*.zip")
+            [ -z "$ROM_ZIP" ] && ROM_ZIP=$(pick_zip $SIZE ! -name "target_files*.zip")
+            [ -z "$ROM_ZIP" ] && ROM_ZIP=$(pick_zip $SIZE)
+            [ -n "$ROM_ZIP" ] && break
+          done
+
+          if [ -z "$ROM_ZIP" ]; then
+            echo "::error::No .zip found in $PRODUCT_DIR"
+            exit 1
+          fi
+
+          cp -f "$ROM_ZIP" "${{ github.workspace }}/dist/"
+          echo "ROM: $ROM_ZIP"
+
+          find "$PRODUCT_DIR" -maxdepth 1 -name "target_files*.zip" -type f \
+            | while read -r TF; do cp -f "$TF" "${{ github.workspace }}/dist/"; echo "Target files: $TF"; done
+
+          ls -lh "${{ github.workspace }}/dist"
+          ROM_BYTES=$(stat -c %s "$ROM_ZIP")
+          echo "ROM_ZIP=$(basename "$ROM_ZIP")" >> $GITHUB_OUTPUT
+          echo "ROM_SIZE=$(( (ROM_BYTES + 1048575) / 1048576 ))MB" >> $GITHUB_OUTPUT
+
+      - name: Upload Build ZIP (Artifact)
+        id: upload_zip
+        if: steps.build_rom.outputs.BUILD_SUCCESS == 'true'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.DEVICE }}-${{ inputs.RELEASETYPE }}-${{ inputs.GMS_VARIANT }}-${{ steps.locate_zip.outputs.ROM_ZIP }}
+          path: ${{ github.workspace }}/dist/
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+
+      - name: Build Summary
+        if: always() && steps.build_rom.outputs.BUILD_SUCCESS == 'true'
+        run: |
+          {
+            echo "### ✅ AxionOS build finished"
+            echo ""
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| Device | \`$DEVICE\` |"
+            echo "| Release type | \`$RELEASETYPE\` |"
+            echo "| GMS variant | \`$GMS_VARIANT\` |"
+            echo "| ROM | \`${{ steps.locate_zip.outputs.ROM_ZIP }}\` |"
+            echo "| Size | ${{ steps.locate_zip.outputs.ROM_SIZE }} |"
+            echo "| Artifact upload | ${{ steps.upload_zip.outcome }} |"
+            echo ""
+            if [ "${{ steps.upload_zip.outcome }}" = "success" ]; then
+              echo "Download the zip from this run's **Artifacts** section (bottom-right of the run page)."
+            else
+              echo "::warning::Artifact upload did not succeed - fetch the zip manually from \`$AOSP_SOURCE_DIR/out/target/product/$DEVICE\`."
+            fi
+          } >> $GITHUB_STEP_SUMMARY
+
       - name: Notify Success
         if: steps.build_rom.outputs.BUILD_SUCCESS == 'true'
         run: |
